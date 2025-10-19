@@ -1,0 +1,221 @@
+name: Build and Publish NuGet Package
+
+on:
+  push:
+    branches: [ main ]
+    tags: [ 'v*' ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+    inputs:
+      publish_package:
+        description: 'Publish package to NuGet.org'
+        required: false
+        default: false
+        type: boolean
+
+env:
+  DOTNET_VERSION: '8.0.121'
+  PROJECT_PATH: 'src/Cli/Cli.csproj'
+  SOLUTION_PATH: 'src/Azure.DataApiBuilder.sln'
+  PACKAGE_OUTPUT_DIRECTORY: 'src/Cli/nupkg'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    outputs:
+      package-version: ${{ steps.version.outputs.package-version }}
+      package-path: ${{ steps.pack.outputs.package-path }}
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0  # Fetch full history for GitVersion
+
+    - name: Setup .NET
+      uses: actions/setup-dotnet@v4
+      with:
+        dotnet-version: ${{ env.DOTNET_VERSION }}
+        global-json-file: global.json
+
+    - name: Cache dependencies
+      uses: actions/cache@v4
+      with:
+        path: ~/.nuget/packages
+        key: ${{ runner.os }}-nuget-${{ hashFiles('**/*.csproj', '**/Directory.Packages.props') }}
+        restore-keys: |
+          ${{ runner.os }}-nuget-
+
+    - name: Restore dependencies
+      run: dotnet restore ${{ env.SOLUTION_PATH }} --configfile Nuget.config
+
+    - name: Determine version
+      id: version
+      run: |
+        # Read version from Directory.Build.props
+        VERSION=$(grep -oP '<Version>\K[^<]+' src/Directory.Build.props)
+        MAJOR=$(echo $VERSION | cut -d'.' -f1)
+        MINOR=$(echo $VERSION | cut -d'.' -f2)
+        
+        # Determine package version based on trigger
+        if [[ "${{ github.ref }}" =~ ^refs/tags/v.* ]]; then
+          # Release tag - use clean version (e.g., v1.7.0 -> 1.7.0)
+          PACKAGE_VERSION="${GITHUB_REF#refs/tags/v}"
+          echo "Release build for tag: $PACKAGE_VERSION"
+        elif [[ "${{ github.ref }}" == "refs/heads/main" ]]; then
+          # Main branch - append build number (e.g., 1.7.0-123)
+          PACKAGE_VERSION="${MAJOR}.${MINOR}.0-${{ github.run_number }}"
+          echo "Main branch build: $PACKAGE_VERSION"
+        else
+          # PR or other branch - append PR number and build number
+          PACKAGE_VERSION="${MAJOR}.${MINOR}.0-pr${{ github.event.number }}-${{ github.run_number }}"
+          echo "PR/Branch build: $PACKAGE_VERSION"
+        fi
+        
+        echo "package-version=$PACKAGE_VERSION" >> $GITHUB_OUTPUT
+        echo "Package version will be: $PACKAGE_VERSION"
+
+    - name: Build solution
+      run: |
+        dotnet build ${{ env.SOLUTION_PATH }} \
+          --configuration Release \
+          --no-restore \
+          --verbosity normal \
+          -p:Version=${{ steps.version.outputs.package-version }}
+
+    - name: Run tests
+      run: |
+        dotnet test ${{ env.SOLUTION_PATH }} \
+          --configuration Release \
+          --no-build \
+          --verbosity normal \
+          --logger trx \
+          --results-directory test-results \
+          --collect:"XPlat Code Coverage"
+
+    - name: Upload test results
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: test-results
+        path: test-results/
+
+    - name: Pack NuGet package
+      id: pack
+      run: |
+        dotnet pack ${{ env.PROJECT_PATH }} \
+          --configuration Release \
+          --no-build \
+          --output ${{ env.PACKAGE_OUTPUT_DIRECTORY }} \
+          -p:Version=${{ steps.version.outputs.package-version }} \
+          -p:PackageVersion=${{ steps.version.outputs.package-version }}
+        
+        # Find the generated package file
+        PACKAGE_FILE=$(find ${{ env.PACKAGE_OUTPUT_DIRECTORY }} -name "*.nupkg" | head -1)
+        echo "package-path=$PACKAGE_FILE" >> $GITHUB_OUTPUT
+        echo "Generated package: $PACKAGE_FILE"
+
+    - name: Upload NuGet package artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: nuget-package
+        path: ${{ env.PACKAGE_OUTPUT_DIRECTORY }}/*.nupkg
+        retention-days: 30
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    if: |
+      (github.ref == 'refs/heads/main' && github.event_name == 'push') ||
+      (startsWith(github.ref, 'refs/tags/v') && github.event_name == 'push') ||
+      (github.event_name == 'workflow_dispatch' && inputs.publish_package == true)
+    
+    environment: 
+      name: nuget-publishing
+      url: https://www.nuget.org/packages/Microsoft.DataApiBuilder
+
+    steps:
+    - name: Download NuGet package
+      uses: actions/download-artifact@v4
+      with:
+        name: nuget-package
+        path: ./packages
+
+    - name: Setup .NET
+      uses: actions/setup-dotnet@v4
+      with:
+        dotnet-version: ${{ env.DOTNET_VERSION }}
+
+    - name: Publish to NuGet.org
+      env:
+        NUGET_API_KEY: ${{ secrets.NUGET_API_KEY }}
+      run: |
+        PACKAGE_FILE=$(find ./packages -name "*.nupkg" | head -1)
+        echo "Publishing package: $PACKAGE_FILE"
+        echo "Package version: ${{ needs.build.outputs.package-version }}"
+        
+        # Publish to NuGet.org
+        dotnet nuget push "$PACKAGE_FILE" \
+          --api-key $NUGET_API_KEY \
+          --source https://api.nuget.org/v3/index.json \
+          --timeout 300
+
+    - name: Create GitHub Release
+      if: startsWith(github.ref, 'refs/tags/v')
+      uses: actions/create-release@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        tag_name: ${{ github.ref }}
+        release_name: Data API Builder v${{ needs.build.outputs.package-version }}
+        body: |
+          ## Data API Builder v${{ needs.build.outputs.package-version }}
+          
+          ### What's New
+          - PostgreSQL command timeout configuration support
+          - Enhanced data source options for PostgreSQL
+          
+          ### Installation
+          ```bash
+          dotnet tool install --global Microsoft.DataApiBuilder --version ${{ needs.build.outputs.package-version }}
+          ```
+          
+          ### NuGet Package
+          [Microsoft.DataApiBuilder v${{ needs.build.outputs.package-version }}](https://www.nuget.org/packages/Microsoft.DataApiBuilder/${{ needs.build.outputs.package-version }})
+        draft: false
+        prerelease: ${{ contains(github.ref, '-rc') || contains(github.ref, '-preview') }}
+
+  # Optional: Publish to GitHub Packages as well
+  publish-github:
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+    - name: Download NuGet package
+      uses: actions/download-artifact@v4
+      with:
+        name: nuget-package
+        path: ./packages
+
+    - name: Setup .NET
+      uses: actions/setup-dotnet@v4
+      with:
+        dotnet-version: ${{ env.DOTNET_VERSION }}
+
+    - name: Publish to GitHub Packages
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        PACKAGE_FILE=$(find ./packages -name "*.nupkg" | head -1)
+        echo "Publishing package to GitHub Packages: $PACKAGE_FILE"
+        
+        dotnet nuget push "$PACKAGE_FILE" \
+          --api-key $GITHUB_TOKEN \
+          --source https://nuget.pkg.github.com/${{ github.repository_owner }}/index.json \
+          --timeout 300
